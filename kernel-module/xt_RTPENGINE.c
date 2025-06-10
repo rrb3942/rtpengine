@@ -3968,7 +3968,7 @@ static void play_stream_schedule_packet(struct play_stream *stream) {
 static void play_stream_send_packet(struct play_stream *stream, struct play_stream_packet *packet) {
 	struct sk_buff *skb;
 	struct rtp_parsed rtp;
-       
+
 	skb = alloc_skb(packet->len + MAX_HEADER + MAX_SKB_TAIL_ROOM, GFP_KERNEL);
 	if (!skb)
 		return; // XXX log/count error?
@@ -4068,7 +4068,7 @@ static int timer_worker(void *p) {
 			packet = stream->position;
 			packet_scheduled = play_stream_packet_time(stream, packet);
 			//printk(KERN_WARNING "next packet %p at %li, time now %li\n", packet,
-					//(long int) ktime_to_ns(packet_scheduled), 
+					//(long int) ktime_to_ns(packet_scheduled),
 					//(long int) ktime_to_ns(now));
 
 			if (ktime_after(now, packet_scheduled)) {
@@ -6507,7 +6507,6 @@ do_stats:
 	}
 
 	target_put(g);
-	table_put(t);
 	if (skb)
 		kfree_skb(skb);
 
@@ -6522,95 +6521,135 @@ out:
 	target_put(g);
 out_no_target:
 	kfree_skb(skb);
-	table_put(t);
 	return error_nf_action;
 }
 
 
+static unsigned int rtpengine_process_packet46(struct sk_buff *oskb, struct rtpengine_table *t, const struct xt_action_param *par, sa_family_t family)
+{
+    struct sk_buff *skb;
+    struct re_address src, dst;
+    uint8_t tos_val;
 
+    skb = skb_copy_expand(oskb, MAX_HEADER, MAX_SKB_TAIL_ROOM, GFP_ATOMIC);
+    if (!skb) {
+        return XT_CONTINUE;
+    }
 
+    skb_gso_reset(skb);
+    skb_reset_network_header(skb);
 
+    memset(&src, 0, sizeof(src));
+    memset(&dst, 0, sizeof(dst));
+    src.family = family;
+    dst.family = family;
 
-static unsigned int rtpengine4(struct sk_buff *oskb, const struct xt_action_param *par) {
-	const struct xt_rtpengine_info *pinfo = par->targinfo;
-	struct sk_buff *skb;
-	struct iphdr *ih;
-	struct rtpengine_table *t;
-	struct re_address src, dst;
+    if (family == AF_INET) {
+        struct iphdr *ih_copy = ip_hdr(skb);
+        skb_pull(skb, (ih_copy->ihl << 2));
+        if (ih_copy->protocol != IPPROTO_UDP)
+            goto skip;
+        src.u.ipv4 = ih_copy->saddr;
+        dst.u.ipv4 = ih_copy->daddr;
+        tos_val = (uint8_t)ih_copy->tos;
+    } else { /* AF_INET6 */
+        struct ipv6hdr *ih6_copy = ipv6_hdr(skb);
+        skb_pull(skb, sizeof(*ih6_copy));
+        if (ih6_copy->nexthdr != IPPROTO_UDP)
+            goto skip;
+        memcpy(&src.u.ipv6, &ih6_copy->saddr, sizeof(src.u.ipv6));
+        memcpy(&dst.u.ipv6, &ih6_copy->daddr, sizeof(dst.u.ipv6));
+        tos_val = ipv6_get_dsfield(ih6_copy);
+    }
 
-	t = get_table(pinfo->id);
-	if (!t)
-		goto skip;
+    return rtpengine46(skb, oskb, t, &src, &dst, tos_val, par);
 
-	skb = skb_copy_expand(oskb, MAX_HEADER, MAX_SKB_TAIL_ROOM, GFP_ATOMIC);
-	if (!skb)
-		goto skip3;
-
-	skb_gso_reset(skb);
-	skb_reset_network_header(skb);
-	ih = ip_hdr(skb);
-	skb_pull(skb, (ih->ihl << 2));
-	if (ih->protocol != IPPROTO_UDP)
-		goto skip2;
-
-	memset(&src, 0, sizeof(src));
-	memset(&dst, 0, sizeof(dst));
-	src.family = AF_INET;
-	src.u.ipv4 = ih->saddr;
-	dst.family = AF_INET;
-	dst.u.ipv4 = ih->daddr;
-
-	return rtpengine46(skb, oskb, t, &src, &dst, (uint8_t)ih->tos, par);
-
-skip2:
-	kfree_skb(skb);
-skip3:
-	table_put(t);
 skip:
-	return XT_CONTINUE;
+    kfree_skb(skb);
+    return XT_CONTINUE;
 }
 
+static unsigned int rtpengine_main_target(struct sk_buff *oskb, const struct xt_action_param *par, sa_family_t family) {
+    const struct xt_rtpengine_info *pinfo = par->targinfo;
+    struct rtpengine_table *t;
+    unsigned int ret = XT_CONTINUE;
 
+    t = get_table(pinfo->id);
+    if (!t)
+        return XT_CONTINUE;
 
+    if (!skb_is_gso(oskb)) {
+        /* No gso, just process the packet */
+        ret = rtpengine_process_packet46(oskb, t, par, family);
+        goto out;
+    }
+
+	/* We only want to handle UDP GSO */
+	if (!(skb_shinfo(oskb)->gso_type & SKB_GSO_UDP_L4)) {
+		goto out;
+	}
+
+    /* GSO path */
+    /* Clone to segment, leaving oskb untouched if we need to XT_CONTINUE */
+    struct sk_buff *clone = skb_clone(oskb, GFP_ATOMIC);
+
+    if (IS_ERR_OR_NULL(clone)) {
+        goto out;
+    }
+
+    /* Split the skb into a list */
+    struct sk_buff *segs_list = skb_gso_segment(clone, 0);
+
+	/* Don't need clone, will either use segs_list or oskb */
+	consume_skb(clone);
+
+    if (IS_ERR(segs_list)) {;
+        goto out;
+    }
+
+	/* No segementation required, operate on origial oskb*/
+    if (!segs_list) {
+		ret = rtpengine_process_packet46(oskb, t, par, family);
+		goto out;
+	}
+
+    /* Try processing the first packet in the stream, if it fails we can
+       still recover and fallback for the entire list*/
+    ret = rtpengine_process_packet46(segs_list, t, par, family);
+
+    if (ret == XT_CONTINUE) {
+        /* Unhandled stream */
+        goto cleanup;
+    }
+
+    /* After this point we must drop all segments, unless we can
+       somehow modify oskb to removed processed segments */
+
+    /* Process remaining segments */
+    struct sk_buff *curr_seg, *next_seg;
+    skb_list_walk_safe(segs_list->next, curr_seg, next_seg) {
+            /* Process each segment as its own packet */
+            unsigned int seg_ret = rtpengine_process_packet46(curr_seg, t, par, family);
+
+            /* We can't selectively only pass certain packets from the frag list */
+            if (WARN_ON_ONCE(seg_ret != NF_DROP)) {
+                atomic64_inc(&t->rtpe_stats->errors_kernel);
+            }
+    }
+
+cleanup:
+    kfree_skb_list(segs_list);
+out:
+    table_put(t);
+    return ret;
+}
+
+static unsigned int rtpengine4(struct sk_buff *oskb, const struct xt_action_param *par) {
+	return rtpengine_main_target(oskb, par, AF_INET);
+}
 
 static unsigned int rtpengine6(struct sk_buff *oskb, const struct xt_action_param *par) {
-	const struct xt_rtpengine_info *pinfo = par->targinfo;
-	struct sk_buff *skb;
-	struct ipv6hdr *ih;
-	struct rtpengine_table *t;
-	struct re_address src, dst;
-
-	t = get_table(pinfo->id);
-	if (!t)
-		goto skip;
-
-	skb = skb_copy_expand(oskb, MAX_HEADER, MAX_SKB_TAIL_ROOM, GFP_ATOMIC);
-	if (!skb)
-		goto skip3;
-
-	skb_gso_reset(skb);
-	skb_reset_network_header(skb);
-	ih = ipv6_hdr(skb);
-
-	skb_pull(skb, sizeof(*ih));
-	if (ih->nexthdr != IPPROTO_UDP)
-		goto skip2;
-
-	memset(&src, 0, sizeof(src));
-	memset(&dst, 0, sizeof(dst));
-	src.family = AF_INET6;
-	memcpy(&src.u.ipv6, &ih->saddr, sizeof(src.u.ipv6));
-	dst.family = AF_INET6;
-	memcpy(&dst.u.ipv6, &ih->daddr, sizeof(dst.u.ipv6));
-
-	return rtpengine46(skb, oskb, t, &src, &dst, ipv6_get_dsfield(ih), par);
-
-skip2:
-	kfree_skb(skb);
-skip3:
-	table_put(t);
-skip:
-	return XT_CONTINUE;
+	return rtpengine_main_target(oskb, par, AF_INET6);
 }
 
 

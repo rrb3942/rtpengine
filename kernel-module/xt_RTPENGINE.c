@@ -54,6 +54,17 @@ MODULE_IMPORT_NS(CRYPTO_INTERNAL);
 MODULE_ALIAS("ipt_RTPENGINE");
 MODULE_ALIAS("ip6t_RTPENGINE");
 
+#define MY_RECURSION_MARK 0x80000000
+#define MY_RECURSION_MASK 0x80000000
+
+static u32 loop_mark = MY_RECURSION_MARK;
+module_param(loop_mark, uint, 0644);
+MODULE_PARM_DESC(loop_mark, "Firewall mark to use for recursion prevention");
+
+static u32 mark_mask = MY_RECURSION_MASK;
+module_param(mark_mask, uint, 0644);
+MODULE_PARM_DESC(mark_mask, "Firewall mask to use for recursion prevention");
+
 // fix for older compilers
 #ifndef RHEL_RELEASE_VERSION
 #define RHEL_RELEASE_VERSION(x,y) 0
@@ -176,8 +187,26 @@ MODULE_ALIAS("ip6t_RTPENGINE");
 #define PDE_DATA(i) pde_data(i)
 #endif
 
+/**
+ * SKB_MARK_LOOP - Safely sets a recursion-prevention mark on an sk_buff.
+ * @skb: The sk_buff to modify.
+ *
+ * This macro applies SKB_LOOP_RECURSION_MARK, preserving all other mark bits.
+ */
+#define SKB_MARK_LOOP(skb) \
+	do { \
+		(skb)->mark = ((skb)->mark & ~mark_mask) | loop_mark; \
+	} while (0)
 
-
+/**
+ * SKB_IS_LOOP - Tests if the recursion-prevention mark is set on an sk_buff.
+ * @skb: The sk_buff to test.
+ *
+ * Returns:
+ * True if the packet has been marked by SKB_MARK_LOOP, false otherwise.
+ */
+#define SKB_IS_LOOP(skb) \
+	(((skb)->mark & mark_mask) == loop_mark)
 
 struct re_hmac;
 struct re_cipher;
@@ -6574,6 +6603,10 @@ static unsigned int rtpengine_main_target(struct sk_buff *oskb, const struct xt_
     struct rtpengine_table *t;
     unsigned int ret = XT_CONTINUE;
 
+	if (SKB_IS_LOOP(oskb) || oskb->tstamp < 0) {
+		return XT_CONTINUE; // already processed
+	}
+
     t = get_table(pinfo->id);
     if (!t)
         return XT_CONTINUE;
@@ -6598,47 +6631,77 @@ static unsigned int rtpengine_main_target(struct sk_buff *oskb, const struct xt_
     }
 
     /* Split the skb into a list */
-    struct sk_buff *segs_list = skb_gso_segment(clone, 0);
+    struct sk_buff *head = skb_gso_segment(clone, 0);
 
-	/* Don't need clone, will either use segs_list or oskb */
+	/* Don't need clone, will either use head or oskb */
 	consume_skb(clone);
 
-    if (IS_ERR(segs_list)) {;
+    if (IS_ERR(head)) {;
         goto out;
     }
 
-	/* No segementation required, operate on origial oskb*/
-    if (!segs_list) {
+	/* No segmentation required, operate on original oskb*/
+    if (!head) {
 		ret = rtpengine_process_packet46(oskb, t, par, family);
 		goto out;
 	}
 
+	struct sk_buff *curr_seg = head;
+
     /* Try processing the first packet in the stream, if it fails we can
        still recover and fallback for the entire list*/
-    ret = rtpengine_process_packet46(segs_list, t, par, family);
+    ret = rtpengine_process_packet46(curr_seg, t, par, family);
 
-    if (ret == XT_CONTINUE) {
+	if (ret == XT_CONTINUE && curr_seg->tstamp >= 0) {
         /* Unhandled stream */
-        goto cleanup;
+	    kfree_skb_list(head);
+        goto out;
     }
 
-    /* After this point we must drop all segments, unless we can
-       somehow modify oskb to removed processed segments */
+	/* Advanced the list */
+	head = curr_seg->next;
+	curr_seg->next = NULL; 
+
+	/* XT_CONTINUE with negative timestamp is processed RTCP that needs userspace still */
+    if (ret == XT_CONTINUE && curr_seg->tstamp < 0) {
+		curr_seg->dev = oskb->dev; // set device to original skb's device
+		SKB_MARK_LOOP(curr_seg); // mark as looped
+		/* Reinject the rtcp packet */
+		if (netif_receive_skb(curr_seg) == NET_RX_DROP) {
+			/* If the packet was dropped, we can free it */
+			kfree_skb(curr_seg);
+			atomic64_inc(&t->rtpe_stats->errors_kernel);
+		}
+
+		ret = NF_DROP;
+	} else {
+		/* If we are not reinjecting, free the segment */
+		kfree_skb(curr_seg);
+	}
 
     /* Process remaining segments */
-    struct sk_buff *curr_seg, *next_seg;
-    skb_list_walk_safe(segs_list->next, curr_seg, next_seg) {
+	struct sk_buff *next_seg = NULL;
+    skb_list_walk_safe(head, curr_seg, next_seg) {
             /* Process each segment as its own packet */
             unsigned int seg_ret = rtpengine_process_packet46(curr_seg, t, par, family);
 
-            /* We can't selectively only pass certain packets from the frag list */
-            if (WARN_ON_ONCE(seg_ret != NF_DROP)) {
-                atomic64_inc(&t->rtpe_stats->errors_kernel);
+			curr_seg->next = NULL;
+            /* Reinject anything that wants to pass at this point */
+            if (seg_ret == XT_CONTINUE) {	
+				curr_seg->dev = oskb->dev; // set device to original skb's device
+				SKB_MARK_LOOP(curr_seg); // mark as looped
+				/* Reinject the rtcp packet */
+				if (netif_receive_skb(curr_seg) == NET_RX_DROP) {
+					/* If the packet was dropped, we can free it */
+					kfree_skb(curr_seg);
+					atomic64_inc(&t->rtpe_stats->errors_kernel);
+				}
+			} else {
+				/* Only free segment if we aren't reinjecting */
+				kfree_skb(curr_seg);
             }
     }
 
-cleanup:
-    kfree_skb_list(segs_list);
 out:
     table_put(t);
     return ret;
